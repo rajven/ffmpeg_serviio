@@ -72,8 +72,10 @@ sudo chmod 755 /var/log/ffmpeg /fast/cache/converted
 
 В стартовом скрипте /opt/serviio/bin/serviio.sh добавить "-Dffmpeg.location=/usr/local/bin/ffmpeg_serviio" в SERVIIO_JAVA_OPTS
 
+```
 # Setup Serviio specific properties
 SERVIIO_JAVA_OPTS="-Djava.net.preferIPv4Stack=true -Djava.awt.headless=true -Dorg.restlet.engine.loggerFacadeClass=org.restlet.ext.slf4j.Slf4jLoggerFacade -Dderby.system.home=$SERVIIO_HOME/library -Dserviio.home=$SERVIIO_HOME -Dffmpeg.location=/usr/local/bin/ffmpeg_serviio -Ddcraw.location=dcraw"
+```
 
 ```bash
 
