@@ -229,12 +229,6 @@ sudo intel_gpu_top
 cat /sys/class/drm/card0/device/gpu_busy_percent
 ```
 
-### Проверка, что обёртка работает
-```bash
-# Должен вывести PID скрипта, а не ffmpeg.real
-ps aux | grep ffmpeg
-```
-
 ---
 
 ## 🛠️ Кастомизация
@@ -270,15 +264,6 @@ CACHE_DIR="/fast/cache/converted"            # Долговременный кэ
 ## 📄 Лицензия
 
 MIT License. Используйте на свой страх и риск.
-
----
-
-## 🤝 Вклад
-
-Pull request'ы приветствуются! Перед отправкой:
-1. Протестируйте на реальном transcoding-запросе
-2. Проверьте, что логи читаемы
-3. Обновите README при изменении поведения
 
 ---
 

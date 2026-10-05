@@ -244,13 +244,6 @@ sudo intel_gpu_top
 cat /sys/class/drm/card0/device/gpu_busy_percent
 ```
 
-### Verify that the wrapper is working
-
-```bash
-# Should show the wrapper process, not ffmpeg.real
-ps aux | grep ffmpeg
-```
-
 ---
 
 ## 🛠️ Customization
@@ -288,16 +281,6 @@ Encoding modes are defined in the `build_command` function:
 ## 📄 License
 
 MIT License. Use at your own risk.
-
----
-
-## 🤝 Contributing
-
-Pull requests are welcome! Before submitting:
-
-1. Test with a real transcoding request
-2. Make sure the logs are readable
-3. Update the README if the behavior changes
 
 ---
 
