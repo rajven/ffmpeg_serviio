@@ -1,0 +1,547 @@
+#!/bin/bash
+
+# Каталог для логов скрипта
+LOG_DIR="/var/log/ffmpeg"
+
+# Файл для логов скрипта
+SCRIPT_LOG="${LOG_DIR}/ffmpeg_serviio.log"
+
+# Каталог транскодирования SERVIIO
+SERVIIO_CACHE_DIR="/fast/cache/serviio/Serviio"
+
+# Результат успешного транскодирования
+CACHE_DIR="/fast/cache/converted"
+
+# Тег для syslog
+LOGGER_TAG="ffmpeg_serviio"
+
+USER_ID=$(id -u)
+USER_NAME=$(id -un)
+GROUP_ID=$(id -g)
+GROUP_NAME=$(id -gn)
+
+PARENT_LOG_DIR=$(dirname "${LOG_DIR}")
+PARENT_CACHE_DIR=$(dirname "${CACHE_DIR}")
+PARENT_SERVIIO_CACHE_DIR=$(dirname "${SERVIIO_CACHE_DIR}")
+
+NEED_ROOT=
+
+# Функции для логирования в syslog
+log_info()    { logger -t "$LOGGER_TAG" -p user.info "$1"; }
+log_warning() { logger -t "$LOGGER_TAG" -p user.warning "$1"; }
+log_error()   { logger -t "$LOGGER_TAG" -p user.err "$1"; }
+log_debug()   { logger -t "$LOGGER_TAG" -p user.debug "$1"; }
+
+# Создаем директорию для логов если не существует
+if [ ! -d "${LOG_DIR}" ]; then
+    if [ -w "${PARENT_LOG_DIR}" ]; then
+        mkdir -p "${LOG_DIR}"
+        log_info "Created log directory: ${LOG_DIR}"
+    else
+        NEED_ROOT=1
+        log_warning "Cannot create log directory ${LOG_DIR} - need root"
+    fi
+fi
+
+# Создаем директорию для результата транскодирования если не существует
+if [ ! -d "${CACHE_DIR}" ]; then
+    if [ -w "${PARENT_CACHE_DIR}" ]; then
+        mkdir -p "${CACHE_DIR}"
+        log_info "Created cache directory: ${CACHE_DIR}"
+    else
+        NEED_ROOT=1
+        log_warning "Cannot create cache directory ${CACHE_DIR} - need root"
+    fi
+fi
+
+if [ -n "${NEED_ROOT}" ]; then
+    log_error "Insufficient permissions to create directories"
+    echo "Create the necessary directories from root:"
+    echo "mkdir -p ${LOG_DIR}"
+    echo "mkdir -p ${CACHE_DIR}"
+    echo "chown ${USER_NAME}:${GROUP_NAME} ${LOG_DIR}"
+    echo "chown ${USER_NAME}:${GROUP_NAME} ${CACHE_DIR}"
+    echo "Bye!"
+    exit 100
+fi
+
+# Логируем запуск
+log_info "=== ffmpeg_serviio started (PID: $$) ==="
+log_info "User: $USER_NAME (UID: $USER_ID), Group: $GROUP_NAME (GID: $GROUP_ID)"
+log_info "Command: ffmpeg $*"
+
+{
+    echo "=== $(date): ffmpeg_serviio started ==="
+    echo "PID: $$"
+    echo "User: $USER_NAME (UID: $USER_ID)"
+    echo "Group: $GROUP_NAME (GID: $GROUP_ID)"
+    echo "Command: ffmpeg $@"
+} >> "$SCRIPT_LOG"
+
+RENDER_GROUP=$(getfacl -d -p /dev/dri/renderD128 | grep group | awk '{ print $NF }')
+CARD_GROUP=$(getfacl -d -p /dev/dri/card0 | grep group | awk '{ print $NF }')
+
+log_debug "Render device group: $RENDER_GROUP, Card device group: $CARD_GROUP"
+
+if groups | grep -qw "${RENDER_GROUP}"; then
+    log_info "User $USER_NAME is a member of group ${RENDER_GROUP}"
+    echo "User: $USER_NAME (UID: $USER_ID) is a member of the group ${RENDER_GROUP} " >> "$SCRIPT_LOG"
+else
+    log_error "User $USER_NAME is NOT a member of group ${RENDER_GROUP}"
+    echo "User: $USER_NAME (UID: $USER_ID) is not a member of the group ${RENDER_GROUP}! " >> "$SCRIPT_LOG"
+    exit 101
+fi
+
+if groups | grep -qw "${CARD_GROUP}"; then
+    log_info "User $USER_NAME is a member of group ${CARD_GROUP}"
+    echo "User: $USER_NAME (UID: $USER_ID) is a member of the group ${CARD_GROUP}" >> "$SCRIPT_LOG"
+else
+    log_error "User $USER_NAME is NOT a member of group ${CARD_GROUP}"
+    echo "User: $USER_NAME (UID: $USER_ID) is not a member of the group ${CARD_GROUP}! " >> "$SCRIPT_LOG"
+    exit 102
+fi
+
+# Убедимся, что путь заканчивается на /
+if [[ "$SERVIIO_CACHE_DIR" != */ ]]; then
+    SERVIIO_CACHE_DIR="$SERVIIO_CACHE_DIR/"
+fi
+
+# Проверяем, содержит ли любой из аргументов путь serviio
+SERVIIO_OUTPUT=false
+OUTPUT_FILE=""
+INPUT_FILE=""
+HAS_FILTER_COMPLEX=false
+FILTER_COMPLEX_VALUE=""
+VIDEO_CODEC_IS_COPY=false
+
+# Анализируем аргументы
+i=1
+while [ $i -le $# ]; do
+    arg="${!i}"
+
+    if [[ "$arg" == *"$SERVIIO_CACHE_DIR"* ]]; then
+        SERVIIO_OUTPUT=true
+        OUTPUT_FILE="$arg"
+        log_debug "Detected Serviio output: $OUTPUT_FILE"
+    fi
+
+    if [[ "$arg" == "-i" ]] && [ -z "$INPUT_FILE" ]; then
+        INPUT_FILE="${@:$((i+1)):1}"
+        log_debug "Input file: $INPUT_FILE"
+    fi
+
+    if [[ "$arg" == "-filter_complex" ]]; then
+        HAS_FILTER_COMPLEX=true
+        FILTER_COMPLEX_VALUE="${@:$((i+1)):1}"
+        log_debug "Filter complex detected: $FILTER_COMPLEX_VALUE"
+    fi
+
+    # ===== НОВОЕ: обнаружение -c:v copy =====
+    if [[ "$arg" == "-c:v" ]]; then
+        local_next="${@:$((i+1)):1}"
+        if [[ "$local_next" == "copy" ]]; then
+            VIDEO_CODEC_IS_COPY=true
+            log_info "Video codec is COPY (remux only, no transcoding needed)"
+        fi
+    fi
+
+    ((i++))
+done
+
+# ===== НОВОЕ: если -c:v copy, просто пропускаем через ffmpeg без изменений =====
+if [ "$VIDEO_CODEC_IS_COPY" = true ]; then
+    log_info "Stream copy mode — passing through to ffmpeg unchanged"
+    {
+        echo "=== Stream copy mode (remux) — no transcoding ==="
+        echo "=== Starting ffmpeg as-is ==="
+    } >> "$SCRIPT_LOG"
+
+    /usr/bin/ffmpeg "$@"
+    exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        log_info "Stream copy completed successfully"
+    else
+        log_error "Stream copy failed with exit code: $exit_code"
+    fi
+
+    {
+        echo "=== $(date): Stream copy finished with exit code: $exit_code ==="
+        echo "=== ============================================================== ==="
+    } >> "$SCRIPT_LOG"
+
+    exit $exit_code
+fi
+
+if [ "$SERVIIO_OUTPUT" = false ]; then
+    log_info "Using standard software transcoding (non-Serviio)"
+    {
+        echo "=== Using standard software transcoding ==="
+        echo "=== Starting standard ffmpeg ==="
+    } >> "$SCRIPT_LOG"
+
+    /usr/bin/ffmpeg "$@"
+    exit_code=$?
+
+    if [ $exit_code -eq 0 ]; then
+        log_info "Standard ffmpeg finished successfully"
+    else
+        log_error "Standard ffmpeg failed with exit code: $exit_code"
+    fi
+
+    {
+        echo "=== $(date): Standard ffmpeg finished with exit code: $exit_code ==="
+        echo "=== =============================================== ==="
+    } >> "$SCRIPT_LOG"
+
+    exit $exit_code
+fi
+
+log_info "Using hardware acceleration for Serviio transcoding"
+log_debug "Input: $INPUT_FILE"
+log_debug "Output: $OUTPUT_FILE"
+log_debug "Has filter_complex: $HAS_FILTER_COMPLEX"
+
+{
+    echo "=== Using hardware acceleration for Serviio transcoding ==="
+    echo "Original command: ffmpeg $@"
+    echo "Input file: $INPUT_FILE"
+    echo "Output file: $OUTPUT_FILE"
+    echo "Has filter_complex (subtitles): $HAS_FILTER_COMPLEX"
+    if [ "$HAS_FILTER_COMPLEX" = true ]; then
+        echo "Filter complex value: $FILTER_COMPLEX_VALUE"
+    fi
+} >> "$SCRIPT_LOG"
+
+# Проверяем наличие файла в кэше перед транскодированием
+CACHE_FILE=""
+if [ -n "$INPUT_FILE" ] && [ -n "$OUTPUT_FILE" ]; then
+    input_basename=$(basename "$INPUT_FILE")
+    input_name="${input_basename%.*}"
+    output_extension="${OUTPUT_FILE##*.}"
+    cache_filename="${input_name}.${output_extension}"
+    CACHE_FILE="${CACHE_DIR}/${cache_filename}"
+
+    log_debug "Checking cache: $CACHE_FILE"
+    {
+        echo "=== Checking cache ==="
+        echo "Cache file: $CACHE_FILE"
+    } >> "$SCRIPT_LOG"
+
+    if [ -f "$CACHE_FILE" ]; then
+        log_info "Cache HIT: $CACHE_FILE"
+        {
+            echo "=== Cache HIT: File found in cache ==="
+            echo "Copying from cache to: $OUTPUT_FILE"
+            echo "Cache file size: $(du -h "$CACHE_FILE" | cut -f1)"
+            echo "Cache file modified: $(stat -c %y "$CACHE_FILE")"
+        } >> "$SCRIPT_LOG"
+
+        if cp "$CACHE_FILE" "$OUTPUT_FILE"; then
+            log_info "Successfully restored from cache"
+            {
+                echo "=== Successfully restored from cache ==="
+                echo "Output file size: $(du -h "$OUTPUT_FILE" | cut -f1)"
+                echo "=== Exiting with code 0 ==="
+                echo "=== ============================================================== ==="
+            } >> "$SCRIPT_LOG"
+            exit 0
+        else
+            log_error "Failed to copy from cache (exit code: $?)"
+            {
+                echo "=== ERROR: Failed to copy from cache ==="
+                echo "Copy command failed with exit code: $?"
+                echo "=== Continuing with transcoding ==="
+            } >> "$SCRIPT_LOG"
+        fi
+    else
+        log_info "Cache MISS — proceeding with transcoding"
+        {
+            echo "=== Cache MISS: File not found in cache ==="
+            echo "Proceeding with transcoding"
+        } >> "$SCRIPT_LOG"
+    fi
+fi
+
+# ====================================================================
+# ИСПРАВЛЕНИЕ: build_command теперь заполняет ГЛОБАЛЬНЫЙ МАССИВ
+# вместо возврата строки. Это сохраняет пробелы в путях.
+# ====================================================================
+BUILT_CMD=()
+
+build_command() {
+    local mode="$1"
+    shift
+    BUILT_CMD=()
+    local i=1
+
+    while [ $i -le $# ]; do
+        local arg="${!i}"
+
+        case "$mode" in
+            "hardware_with_subs")
+                case "$arg" in
+                    "-c:v")
+                        BUILT_CMD+=("-vaapi_device" "/dev/dri/renderD128" "-vf" "format=nv12,hwupload" "-c:v" "h264_vaapi")
+                        ((i++))
+                        ;;
+                    "-i")
+                        BUILT_CMD+=("-hwaccel" "vaapi" "-hwaccel_device" "/dev/dri/renderD128" "-hwaccel_output_format" "vaapi" "-i")
+                        ;;
+                    "-pix_fmt"|"-qscale:v")
+                        ((i++))
+                        ;;
+                    *)
+                        BUILT_CMD+=("$arg")
+                        ;;
+                esac
+                ;;
+
+            "hardware_no_subs")
+                case "$arg" in
+                    "-c:v")
+                        BUILT_CMD+=("-vaapi_device" "/dev/dri/renderD128" "-vf" "format=nv12,hwupload" "-c:v" "h264_vaapi")
+                        ((i++))
+                        ;;
+                    "-i")
+                        BUILT_CMD+=("-hwaccel" "vaapi" "-hwaccel_device" "/dev/dri/renderD128" "-hwaccel_output_format" "vaapi" "-i")
+                        ;;
+                    "-pix_fmt"|"-qscale:v"|"-filter_complex")
+                        ((i++))
+                        ;;
+                    "-map")
+                        local next_arg="${@:$((i+1)):1}"
+                        if [ "$next_arg" = "[v]" ]; then
+                            BUILT_CMD+=("-map" "0:0")
+                            ((i++))
+                        else
+                            BUILT_CMD+=("-map" "$next_arg")
+                            ((i++))
+                        fi
+                        ;;
+                    *)
+                        BUILT_CMD+=("$arg")
+                        ;;
+                esac
+                ;;
+
+            "software_with_subs")
+                case "$arg" in
+                    "-c:v")
+                        BUILT_CMD+=("-c:v" "libx264" "-preset" "medium" "-crf" "23")
+                        ((i++))
+                        ;;
+                    "-pix_fmt")
+                        BUILT_CMD+=("-pix_fmt" "yuv420p")
+                        ((i++))
+                        ;;
+                    *)
+                        BUILT_CMD+=("$arg")
+                        ;;
+                esac
+                ;;
+
+            "software_no_subs")
+                case "$arg" in
+                    "-c:v")
+                        BUILT_CMD+=("-c:v" "libx264" "-preset" "medium" "-crf" "23")
+                        ((i++))
+                        ;;
+                    "-pix_fmt")
+                        BUILT_CMD+=("-pix_fmt" "yuv420p")
+                        ((i++))
+                        ;;
+                    "-filter_complex")
+                        ((i++))
+                        ;;
+                    "-map")
+                        local next_arg="${@:$((i+1)):1}"
+                        if [ "$next_arg" = "[v]" ]; then
+                            BUILT_CMD+=("-map" "0:0")
+                            ((i++))
+                        else
+                            BUILT_CMD+=("-map" "$next_arg")
+                            ((i++))
+                        fi
+                        ;;
+                    *)
+                        BUILT_CMD+=("$arg")
+                        ;;
+                esac
+                ;;
+        esac
+
+        ((i++))
+    done
+}
+
+# Функция для запуска команды
+run_transcoding() {
+    local mode="$1"
+    local description="$2"
+    shift 2
+
+    log_info "$description (mode: $mode)"
+    {
+        echo "=== $description ==="
+        echo "Mode: $mode"
+    } >> "$SCRIPT_LOG"
+
+    # build_command заполняет глобальный массив BUILT_CMD
+    build_command "$mode" "$@"
+
+    # Логируем команду (для читаемости — через строку)
+    log_debug "Command: ffmpeg ${BUILT_CMD[*]}"
+    {
+        echo "Command: ffmpeg ${BUILT_CMD[*]}"
+        echo "=== Starting transcoding ==="
+    } >> "$SCRIPT_LOG"
+
+    # ===== КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: "${BUILT_CMD[@]}" с кавычками! =====
+    # Это сохраняет пробелы в путях к файлам
+    /usr/bin/ffmpeg "${BUILT_CMD[@]}" 2>> "$SCRIPT_LOG"
+    local result=$?
+
+    if [ $result -eq 0 ]; then
+        log_info "$description completed successfully"
+    else
+        log_warning "$description failed with exit code: $result"
+    fi
+
+    {
+        echo "=== Finished with exit code: $result ==="
+    } >> "$SCRIPT_LOG"
+
+    return $result
+}
+
+exit_code=1
+
+# Уровень 1: Аппаратное с субтитрами (если есть субтитры)
+if [ "$HAS_FILTER_COMPLEX" = true ]; then
+    log_info "LEVEL 1: Trying hardware acceleration WITH subtitles"
+    {
+        echo "=== LEVEL 1: Trying hardware acceleration WITH subtitles ==="
+    } >> "$SCRIPT_LOG"
+
+    run_transcoding "hardware_with_subs" "Hardware with subtitles" "$@"
+    exit_code=$?
+fi
+
+# Уровень 2: Аппаратное без субтитров
+if [ $exit_code -ne 0 ]; then
+    log_info "LEVEL 2: Trying hardware acceleration WITHOUT subtitles"
+    {
+        echo "=== LEVEL 2: Trying hardware acceleration WITHOUT subtitles ==="
+    } >> "$SCRIPT_LOG"
+
+    run_transcoding "hardware_no_subs" "Hardware without subtitles" "$@"
+    exit_code=$?
+fi
+
+# Уровень 3: Софтовое с субтитрами (если были субтитры)
+if [ $exit_code -ne 0 ] && [ "$HAS_FILTER_COMPLEX" = true ]; then
+    log_info "LEVEL 3: Trying software encoding WITH subtitles"
+    {
+        echo "=== LEVEL 3: Trying software encoding WITH subtitles ==="
+    } >> "$SCRIPT_LOG"
+
+    run_transcoding "software_with_subs" "Software with subtitles" "$@"
+    exit_code=$?
+fi
+
+# Уровень 4: Софтовое без субтитров
+if [ $exit_code -ne 0 ]; then
+    log_info "LEVEL 4: Trying software encoding WITHOUT subtitles"
+    {
+        echo "=== LEVEL 4: Trying software encoding WITHOUT subtitles ==="
+    } >> "$SCRIPT_LOG"
+
+    run_transcoding "software_no_subs" "Software without subtitles" "$@"
+    exit_code=$?
+fi
+
+echo "$INPUT_FILE" >>${LOG_DIR}/transcoding.log
+
+# Если транскодирование успешно, копируем файл в CACHE_DIR
+if [ $exit_code -eq 0 ] && [ -n "$OUTPUT_FILE" ] && [ -f "$OUTPUT_FILE" ]; then
+    if [ -z "$CACHE_FILE" ] && [ -n "$INPUT_FILE" ]; then
+        input_basename=$(basename "$INPUT_FILE")
+        input_name="${input_basename%.*}"
+        output_extension="${OUTPUT_FILE##*.}"
+        cache_filename="${input_name}.${output_extension}"
+        CACHE_FILE="${CACHE_DIR}/${cache_filename}"
+    elif [ -z "$CACHE_FILE" ]; then
+        cache_filename=$(basename "$OUTPUT_FILE")
+        CACHE_FILE="${CACHE_DIR}/${cache_filename}"
+    fi
+
+    log_debug "Processing cache copy: $OUTPUT_FILE -> $CACHE_FILE"
+    {
+        echo "=== Processing cache copy ==="
+        echo "Source: $OUTPUT_FILE"
+        echo "Destination: $CACHE_FILE"
+    } >> "$SCRIPT_LOG"
+
+    if [ -f "$CACHE_FILE" ]; then
+        log_warning "Cache file already exists: $CACHE_FILE"
+        {
+            echo "=== WARNING: Cache file already exists ==="
+            echo "Existing file: $CACHE_FILE"
+            echo "Size: $(du -h "$CACHE_FILE" | cut -f1)"
+            echo "Modified: $(stat -c %y "$CACHE_FILE")"
+            echo "=== Skipping cache copy ==="
+        } >> "$SCRIPT_LOG"
+    else
+        log_info "Copying transcoded file to cache"
+        {
+            echo "=== Copying transcoded file to cache directory ==="
+        } >> "$SCRIPT_LOG"
+
+        if cp "$OUTPUT_FILE" "$CACHE_FILE"; then
+            log_info "File successfully copied to cache: $CACHE_FILE"
+            {
+                echo "=== File successfully copied to cache ==="
+                echo "Cache file: $CACHE_FILE"
+                echo "File size: $(du -h "$CACHE_FILE" | cut -f1)"
+            } >> "$SCRIPT_LOG"
+        else
+            log_error "Failed to copy to cache (exit code: $?)"
+            {
+                echo "=== ERROR: Failed to copy file to cache ==="
+                echo "Copy command failed with exit code: $?"
+            } >> "$SCRIPT_LOG"
+        fi
+    fi
+else
+    if [ $exit_code -ne 0 ]; then
+        log_error "Skipping cache copy — transcoding failed (exit code: $exit_code)"
+    elif [ ! -f "$OUTPUT_FILE" ]; then
+        log_warning "Skipping cache copy — output file not found: $OUTPUT_FILE"
+    else
+        log_debug "Skipping cache copy — output file path not detected"
+    fi
+
+    {
+        echo "=== Skipping cache copy ==="
+        if [ $exit_code -ne 0 ]; then
+            echo "Reason: Transcoding failed (exit code: $exit_code)"
+        elif [ ! -f "$OUTPUT_FILE" ]; then
+            echo "Reason: Output file not found: $OUTPUT_FILE"
+        else
+            echo "Reason: Output file path not detected"
+        fi
+    } >> "$SCRIPT_LOG"
+fi
+
+if [ $exit_code -eq 0 ]; then
+    log_info "=== ffmpeg_serviio completed successfully ==="
+else
+    log_error "=== ffmpeg_serviio failed with exit code: $exit_code ==="
+fi
+
+{
+    echo "=== ============================================================== ==="
+} >> "$SCRIPT_LOG"
+
+exit $exit_code
