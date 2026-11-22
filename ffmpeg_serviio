@@ -1,5 +1,17 @@
 #!/bin/bash
 
+# v2 (2026-11-22): исправления по результатам ревью — см. комментарии у мест правок:
+#   1) убран -hwaccel_output_format vaapi: с ним фильтграф падал с
+#      "Impossible to convert between the formats" (exit 218), GPU не использовался;
+#   2) ключ кэша = хеш(команда | размер/mtime источника) — нет коллизий по имени
+#      файла и «вечного» устаревшего кэша;
+#   3) атомарная запись в кэш (tmp + mv);
+#   4) проверка групп устройств через stat/id вместо getfacl, запуск не блокируется;
+#   5) в лог пишется реальный код ошибки cp (было всегда 0).
+#
+# v3 (2026-11-22): remux-режим (-c:v copy) тоже использует кэш — раньше эта ветка
+#   выходила раньше секции кэширования, и каждый просмотр ремуксился заново.
+
 # Каталог для логов скрипта
 LOG_DIR="/var/log/ffmpeg"
 
@@ -78,28 +90,50 @@ log_info "Command: ffmpeg $*"
     echo "Command: ffmpeg $@"
 } >> "$SCRIPT_LOG"
 
-RENDER_GROUP=$(getfacl -d -p /dev/dri/renderD128 | grep group | awk '{ print $NF }')
-CARD_GROUP=$(getfacl -d -p /dev/dri/card0 | grep group | awk '{ print $NF }')
+# Проверяем доступ к устройствам VAAPI по группе-владельцу устройства.
+# getfacl -d здесь не нужен: у device-нод нет default ACL, парсинг ловил
+# заголовок "# group: ..." и работал случайно. При невозможности определить
+# группу запуск НЕ блокируем — ffmpeg сам отчитается, если доступа нет.
+check_dri_group() {
+    local dev grp
+    dev="$1"
+    if [ ! -e "$dev" ]; then
+        log_warning "Device $dev not found — group check skipped"
+        echo "Device $dev not found — group check skipped" >> "$SCRIPT_LOG"
+        return 0
+    fi
+    grp=$(stat -c %G "$dev" 2>/dev/null)
+    if [ -z "$grp" ] || [ "$grp" = "?" ]; then
+        log_warning "Cannot determine owning group of $dev — group check skipped"
+        echo "Cannot determine group of $dev — group check skipped" >> "$SCRIPT_LOG"
+        return 0
+    fi
+    if id -nG "$USER_NAME" 2>/dev/null | tr ' ' '\n' | grep -qx "$grp"; then
+        log_info "User $USER_NAME is a member of group '$grp' ($dev)"
+        echo "User: $USER_NAME (UID: $USER_ID) is a member of the group $grp ($dev)" >> "$SCRIPT_LOG"
+    else
+        log_error "User $USER_NAME is NOT a member of group '$grp' ($dev) — VAAPI access will likely fail"
+        echo "User: $USER_NAME (UID: $USER_ID) is not a member of the group $grp ($dev)!" >> "$SCRIPT_LOG"
+        return 1
+    fi
+}
 
-log_debug "Render device group: $RENDER_GROUP, Card device group: $CARD_GROUP"
+check_dri_group /dev/dri/renderD128
+check_dri_group /dev/dri/card0
 
-if groups | grep -qw "${RENDER_GROUP}"; then
-    log_info "User $USER_NAME is a member of group ${RENDER_GROUP}"
-    echo "User: $USER_NAME (UID: $USER_ID) is a member of the group ${RENDER_GROUP} " >> "$SCRIPT_LOG"
-else
-    log_error "User $USER_NAME is NOT a member of group ${RENDER_GROUP}"
-    echo "User: $USER_NAME (UID: $USER_ID) is not a member of the group ${RENDER_GROUP}! " >> "$SCRIPT_LOG"
-    exit 101
-fi
-
-if groups | grep -qw "${CARD_GROUP}"; then
-    log_info "User $USER_NAME is a member of group ${CARD_GROUP}"
-    echo "User: $USER_NAME (UID: $USER_ID) is a member of the group ${CARD_GROUP}" >> "$SCRIPT_LOG"
-else
-    log_error "User $USER_NAME is NOT a member of group ${CARD_GROUP}"
-    echo "User: $USER_NAME (UID: $USER_ID) is not a member of the group ${CARD_GROUP}! " >> "$SCRIPT_LOG"
-    exit 102
-fi
+# Уникальный ключ кэша: имя файла + хеш(полная команда | размер и mtime источника).
+# Разные профили устройств, битрейты и позиции -ss дают разные ключи, а перезапись
+# исходника автоматически инвалидирует кэш (раньше ключ был только по имени файла —
+# одноимённые файлы из разных каталогов получали чужой контент).
+# Функция определена ДО copy-ветки: remux (-c:v copy) тоже кэшируется (v3).
+compute_cache_file() {
+    local input_basename input_name fingerprint key
+    input_basename=$(basename "$1")
+    input_name="${input_basename%.*}"
+    fingerprint=$(stat -c '%s.%Y' "$1" 2>/dev/null || echo "n/a")
+    key=$(printf '%s|%s' "$*" "$fingerprint" | sha256sum | cut -c1-12)
+    CACHE_FILE="${CACHE_DIR}/${input_name}-${key}.${OUTPUT_FILE##*.}"
+}
 
 # Убедимся, что путь заканчивается на /
 if [[ "$SERVIIO_CACHE_DIR" != */ ]]; then
@@ -148,13 +182,60 @@ while [ $i -le $# ]; do
     ((i++))
 done
 
-# ===== НОВОЕ: если -c:v copy, просто пропускаем через ffmpeg без изменений =====
+# ===== если -c:v copy: remux без транскодирования, но С кэшем (v3) =====
 if [ "$VIDEO_CODEC_IS_COPY" = true ]; then
-    log_info "Stream copy mode — passing through to ffmpeg unchanged"
+    log_info "Stream copy mode — remux without transcoding"
     {
         echo "=== Stream copy mode (remux) — no transcoding ==="
-        echo "=== Starting ffmpeg as-is ==="
     } >> "$SCRIPT_LOG"
+
+    # Remux тоже попадает в кэш: повторный просмотр превращает 1-2 минуты
+    # работы ffmpeg в простое копирование с локального диска.
+    CACHE_FILE=""
+    if [ -n "$INPUT_FILE" ] && [ -n "$OUTPUT_FILE" ]; then
+        compute_cache_file "$INPUT_FILE" "$@"
+
+        log_debug "Checking cache (remux): $CACHE_FILE"
+        {
+            echo "=== Checking cache (remux) ==="
+            echo "Cache file: $CACHE_FILE"
+        } >> "$SCRIPT_LOG"
+
+        if [ -f "$CACHE_FILE" ]; then
+            log_info "Cache HIT (remux): $CACHE_FILE"
+            {
+                echo "=== Cache HIT (remux): File found in cache ==="
+                echo "Copying from cache to: $OUTPUT_FILE"
+            } >> "$SCRIPT_LOG"
+
+            if cp "$CACHE_FILE" "$OUTPUT_FILE"; then
+                log_info "Successfully restored from cache (remux)"
+                {
+                    echo "=== Successfully restored from cache (remux) ==="
+                    echo "Output file size: $(du -h "$OUTPUT_FILE" | cut -f1)"
+                    echo "=== Exiting with code 0 ==="
+                    echo "=== ============================================================== ==="
+                } >> "$SCRIPT_LOG"
+                exit 0
+            else
+                rc=$?
+                log_error "Failed to copy from cache (remux, exit code: $rc) — remuxing instead"
+                {
+                    echo "=== ERROR: Failed to copy from cache (remux) ==="
+                    echo "Copy command failed with exit code: $rc"
+                    echo "=== Continuing with remux ==="
+                } >> "$SCRIPT_LOG"
+            fi
+        else
+            log_info "Cache MISS (remux) — proceeding with remux"
+            {
+                echo "=== Cache MISS (remux): File not found in cache ==="
+                echo "Proceeding with remux"
+            } >> "$SCRIPT_LOG"
+        fi
+    fi
+
+    echo "=== Starting ffmpeg as-is ===" >> "$SCRIPT_LOG"
 
     /usr/bin/ffmpeg "$@"
     exit_code=$?
@@ -163,6 +244,50 @@ if [ "$VIDEO_CODEC_IS_COPY" = true ]; then
         log_info "Stream copy completed successfully"
     else
         log_error "Stream copy failed with exit code: $exit_code"
+    fi
+
+    # Успешный remux — атомарно в кэш (те же правила, что и для транскода)
+    if [ $exit_code -eq 0 ] && [ -n "$OUTPUT_FILE" ] && [ -f "$OUTPUT_FILE" ] && [ -n "$INPUT_FILE" ]; then
+        if [ -z "$CACHE_FILE" ]; then
+            compute_cache_file "$INPUT_FILE" "$@"
+        fi
+
+        {
+            echo "=== Processing cache copy (remux) ==="
+            echo "Source: $OUTPUT_FILE"
+            echo "Destination: $CACHE_FILE"
+        } >> "$SCRIPT_LOG"
+
+        if [ -f "$CACHE_FILE" ]; then
+            log_warning "Cache file already exists (remux): $CACHE_FILE"
+            {
+                echo "=== WARNING: Cache file already exists (remux) ==="
+                echo "=== Skipping cache copy ==="
+            } >> "$SCRIPT_LOG"
+        else
+            log_info "Copying remuxed file to cache"
+            {
+                echo "=== Copying remuxed file to cache directory ==="
+            } >> "$SCRIPT_LOG"
+
+            tmp_cache="${CACHE_FILE}.tmp.$$"
+            if cp "$OUTPUT_FILE" "$tmp_cache" && mv "$tmp_cache" "$CACHE_FILE"; then
+                log_info "File successfully copied to cache (remux): $CACHE_FILE"
+                {
+                    echo "=== File successfully copied to cache (remux) ==="
+                    echo "Cache file: $CACHE_FILE"
+                    echo "File size: $(du -h "$CACHE_FILE" | cut -f1)"
+                } >> "$SCRIPT_LOG"
+            else
+                rc=$?
+                rm -f "$tmp_cache"
+                log_error "Failed to copy to cache (remux, exit code: $rc)"
+                {
+                    echo "=== ERROR: Failed to copy file to cache (remux) ==="
+                    echo "Copy command failed with exit code: $rc"
+                } >> "$SCRIPT_LOG"
+            fi
+        fi
     fi
 
     {
@@ -214,13 +339,10 @@ log_debug "Has filter_complex: $HAS_FILTER_COMPLEX"
 } >> "$SCRIPT_LOG"
 
 # Проверяем наличие файла в кэше перед транскодированием
+# (функция compute_cache_file определена выше — до copy-ветки)
 CACHE_FILE=""
 if [ -n "$INPUT_FILE" ] && [ -n "$OUTPUT_FILE" ]; then
-    input_basename=$(basename "$INPUT_FILE")
-    input_name="${input_basename%.*}"
-    output_extension="${OUTPUT_FILE##*.}"
-    cache_filename="${input_name}.${output_extension}"
-    CACHE_FILE="${CACHE_DIR}/${cache_filename}"
+    compute_cache_file "$INPUT_FILE" "$@"
 
     log_debug "Checking cache: $CACHE_FILE"
     {
@@ -247,10 +369,11 @@ if [ -n "$INPUT_FILE" ] && [ -n "$OUTPUT_FILE" ]; then
             } >> "$SCRIPT_LOG"
             exit 0
         else
-            log_error "Failed to copy from cache (exit code: $?)"
+            rc=$?
+            log_error "Failed to copy from cache (exit code: $rc)"
             {
                 echo "=== ERROR: Failed to copy from cache ==="
-                echo "Copy command failed with exit code: $?"
+                echo "Copy command failed with exit code: $rc"
                 echo "=== Continuing with transcoding ==="
             } >> "$SCRIPT_LOG"
         fi
@@ -286,7 +409,12 @@ build_command() {
                         ((i++))
                         ;;
                     "-i")
-                        BUILT_CMD+=("-hwaccel" "vaapi" "-hwaccel_device" "/dev/dri/renderD128" "-hwaccel_output_format" "vaapi" "-i")
+                        # Аппаратное декодирование БЕЗ -hwaccel_output_format: кадры
+                        # автоматически выгружаются в RAM, поэтому программный
+                        # -vf format=nv12,hwupload (кейс -c:v ниже) остаётся валидным.
+                        # С -hwaccel_output_format vaapi фильтграф падал с
+                        # "Impossible to convert between the formats" (exit 218).
+                        BUILT_CMD+=("-hwaccel" "vaapi" "-hwaccel_device" "/dev/dri/renderD128" "-i")
                         ;;
                     "-pix_fmt"|"-qscale:v")
                         ((i++))
@@ -304,7 +432,12 @@ build_command() {
                         ((i++))
                         ;;
                     "-i")
-                        BUILT_CMD+=("-hwaccel" "vaapi" "-hwaccel_device" "/dev/dri/renderD128" "-hwaccel_output_format" "vaapi" "-i")
+                        # Аппаратное декодирование БЕЗ -hwaccel_output_format: кадры
+                        # автоматически выгружаются в RAM, поэтому программный
+                        # -vf format=nv12,hwupload (кейс -c:v ниже) остаётся валидным.
+                        # С -hwaccel_output_format vaapi фильтграф падал с
+                        # "Impossible to convert between the formats" (exit 218).
+                        BUILT_CMD+=("-hwaccel" "vaapi" "-hwaccel_device" "/dev/dri/renderD128" "-i")
                         ;;
                     "-pix_fmt"|"-qscale:v"|"-filter_complex")
                         ((i++))
@@ -461,19 +594,17 @@ if [ $exit_code -ne 0 ]; then
     exit_code=$?
 fi
 
-echo "$INPUT_FILE" >>${LOG_DIR}/transcoding.log
+# В список обработанных попадают только успешно транскодированные файлы
+if [ $exit_code -eq 0 ] && [ -n "$INPUT_FILE" ]; then
+    echo "$INPUT_FILE" >> "${LOG_DIR}/transcoding.log"
+fi
 
 # Если транскодирование успешно, копируем файл в CACHE_DIR
 if [ $exit_code -eq 0 ] && [ -n "$OUTPUT_FILE" ] && [ -f "$OUTPUT_FILE" ]; then
     if [ -z "$CACHE_FILE" ] && [ -n "$INPUT_FILE" ]; then
-        input_basename=$(basename "$INPUT_FILE")
-        input_name="${input_basename%.*}"
-        output_extension="${OUTPUT_FILE##*.}"
-        cache_filename="${input_name}.${output_extension}"
-        CACHE_FILE="${CACHE_DIR}/${cache_filename}"
+        compute_cache_file "$INPUT_FILE" "$@"
     elif [ -z "$CACHE_FILE" ]; then
-        cache_filename=$(basename "$OUTPUT_FILE")
-        CACHE_FILE="${CACHE_DIR}/${cache_filename}"
+        CACHE_FILE="${CACHE_DIR}/$(basename "$OUTPUT_FILE")"
     fi
 
     log_debug "Processing cache copy: $OUTPUT_FILE -> $CACHE_FILE"
@@ -498,7 +629,10 @@ if [ $exit_code -eq 0 ] && [ -n "$OUTPUT_FILE" ] && [ -f "$OUTPUT_FILE" ]; then
             echo "=== Copying transcoded file to cache directory ==="
         } >> "$SCRIPT_LOG"
 
-        if cp "$OUTPUT_FILE" "$CACHE_FILE"; then
+        # Атомарная запись: сперва во временный файл, затем mv внутри той же ФС.
+        # Убитый посреди копирования процесс не оставит битый файл в кэше.
+        tmp_cache="${CACHE_FILE}.tmp.$$"
+        if cp "$OUTPUT_FILE" "$tmp_cache" && mv "$tmp_cache" "$CACHE_FILE"; then
             log_info "File successfully copied to cache: $CACHE_FILE"
             {
                 echo "=== File successfully copied to cache ==="
@@ -506,10 +640,12 @@ if [ $exit_code -eq 0 ] && [ -n "$OUTPUT_FILE" ] && [ -f "$OUTPUT_FILE" ]; then
                 echo "File size: $(du -h "$CACHE_FILE" | cut -f1)"
             } >> "$SCRIPT_LOG"
         else
-            log_error "Failed to copy to cache (exit code: $?)"
+            rc=$?
+            rm -f "$tmp_cache"
+            log_error "Failed to copy to cache (exit code: $rc)"
             {
                 echo "=== ERROR: Failed to copy file to cache ==="
-                echo "Copy command failed with exit code: $?"
+                echo "Copy command failed with exit code: $rc"
             } >> "$SCRIPT_LOG"
         fi
     fi
