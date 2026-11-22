@@ -1,17 +1,5 @@
 #!/bin/bash
 
-# v2 (2026-11-22): исправления по результатам ревью — см. комментарии у мест правок:
-#   1) убран -hwaccel_output_format vaapi: с ним фильтграф падал с
-#      "Impossible to convert between the formats" (exit 218), GPU не использовался;
-#   2) ключ кэша = хеш(команда | размер/mtime источника) — нет коллизий по имени
-#      файла и «вечного» устаревшего кэша;
-#   3) атомарная запись в кэш (tmp + mv);
-#   4) проверка групп устройств через stat/id вместо getfacl, запуск не блокируется;
-#   5) в лог пишется реальный код ошибки cp (было всегда 0).
-#
-# v3 (2026-11-22): remux-режим (-c:v copy) тоже использует кэш — раньше эта ветка
-#   выходила раньше секции кэширования, и каждый просмотр ремуксился заново.
-
 # Каталог для логов скрипта
 LOG_DIR="/var/log/ffmpeg"
 
@@ -26,6 +14,13 @@ CACHE_DIR="/fast/cache/converted"
 
 # Тег для syslog
 LOGGER_TAG="ffmpeg_serviio"
+
+# Уровень детализации файлового лога: INFO (по умолчанию) или DEBUG.
+# INFO: только ключевые события — запуск, уровень каскада, HIT/MISS, ошибки.
+# DEBUG: плюс весь подробный вывод — команды, размеры/даты кэша, разделители.
+# Переопределение без правки скрипта: FFMPEG_SERVIIO_LOG_LEVEL=DEBUG ffmpeg ...
+LOG_LEVEL="${FFMPEG_SERVIIO_LOG_LEVEL:-INFO}"
+LOG_LEVEL="${LOG_LEVEL^^}"
 
 USER_ID=$(id -u)
 USER_NAME=$(id -un)
@@ -43,6 +38,20 @@ log_info()    { logger -t "$LOGGER_TAG" -p user.info "$1"; }
 log_warning() { logger -t "$LOGGER_TAG" -p user.warning "$1"; }
 log_error()   { logger -t "$LOGGER_TAG" -p user.err "$1"; }
 log_debug()   { logger -t "$LOGGER_TAG" -p user.debug "$1"; }
+
+# Файловый лог с уровнями: log_file INFO|DEBUG "строка1" "строка2" ...
+# INFO-строки пишутся всегда, DEBUG-строки — только при LOG_LEVEL=DEBUG.
+log_file() {
+    local req="$1"
+    shift
+    if [ "$req" = "DEBUG" ] && [ "$LOG_LEVEL" != "DEBUG" ]; then
+        return 0
+    fi
+    local line
+    for line in "$@"; do
+        echo "$line" >> "$SCRIPT_LOG"
+    done
+}
 
 # Создаем директорию для логов если не существует
 if [ ! -d "${LOG_DIR}" ]; then
@@ -82,13 +91,12 @@ log_info "=== ffmpeg_serviio started (PID: $$) ==="
 log_info "User: $USER_NAME (UID: $USER_ID), Group: $GROUP_NAME (GID: $GROUP_ID)"
 log_info "Command: ffmpeg $*"
 
-{
-    echo "=== $(date): ffmpeg_serviio started ==="
-    echo "PID: $$"
-    echo "User: $USER_NAME (UID: $USER_ID)"
-    echo "Group: $GROUP_NAME (GID: $GROUP_ID)"
-    echo "Command: ffmpeg $@"
-} >> "$SCRIPT_LOG"
+log_file INFO \
+    "=== $(date): ffmpeg_serviio started ===" \
+    "PID: $$" \
+    "User: $USER_NAME (UID: $USER_ID)" \
+    "Group: $GROUP_NAME (GID: $GROUP_ID)" \
+    "Command: ffmpeg $*"
 
 # Проверяем доступ к устройствам VAAPI по группе-владельцу устройства.
 # getfacl -d здесь не нужен: у device-нод нет default ACL, парсинг ловил
@@ -99,21 +107,21 @@ check_dri_group() {
     dev="$1"
     if [ ! -e "$dev" ]; then
         log_warning "Device $dev not found — group check skipped"
-        echo "Device $dev not found — group check skipped" >> "$SCRIPT_LOG"
+        log_file INFO "Device $dev not found — group check skipped"
         return 0
     fi
     grp=$(stat -c %G "$dev" 2>/dev/null)
     if [ -z "$grp" ] || [ "$grp" = "?" ]; then
         log_warning "Cannot determine owning group of $dev — group check skipped"
-        echo "Cannot determine group of $dev — group check skipped" >> "$SCRIPT_LOG"
+        log_file INFO "Cannot determine group of $dev — group check skipped"
         return 0
     fi
     if id -nG "$USER_NAME" 2>/dev/null | tr ' ' '\n' | grep -qx "$grp"; then
         log_info "User $USER_NAME is a member of group '$grp' ($dev)"
-        echo "User: $USER_NAME (UID: $USER_ID) is a member of the group $grp ($dev)" >> "$SCRIPT_LOG"
+        log_file DEBUG "User: $USER_NAME (UID: $USER_ID) is a member of the group $grp ($dev)"
     else
         log_error "User $USER_NAME is NOT a member of group '$grp' ($dev) — VAAPI access will likely fail"
-        echo "User: $USER_NAME (UID: $USER_ID) is not a member of the group $grp ($dev)!" >> "$SCRIPT_LOG"
+        log_file INFO "User: $USER_NAME (UID: $USER_ID) is not a member of the group $grp ($dev)!"
         return 1
     fi
 }
@@ -185,9 +193,7 @@ done
 # ===== если -c:v copy: remux без транскодирования, но С кэшем (v3) =====
 if [ "$VIDEO_CODEC_IS_COPY" = true ]; then
     log_info "Stream copy mode — remux without transcoding"
-    {
-        echo "=== Stream copy mode (remux) — no transcoding ==="
-    } >> "$SCRIPT_LOG"
+    log_file INFO "=== Stream copy mode (remux) — no transcoding ==="
 
     # Remux тоже попадает в кэш: повторный просмотр превращает 1-2 минуты
     # работы ffmpeg в простое копирование с локального диска.
@@ -196,46 +202,42 @@ if [ "$VIDEO_CODEC_IS_COPY" = true ]; then
         compute_cache_file "$INPUT_FILE" "$@"
 
         log_debug "Checking cache (remux): $CACHE_FILE"
-        {
-            echo "=== Checking cache (remux) ==="
-            echo "Cache file: $CACHE_FILE"
-        } >> "$SCRIPT_LOG"
+        log_file DEBUG \
+            "=== Checking cache (remux) ===" \
+            "Cache file: $CACHE_FILE"
 
         if [ -f "$CACHE_FILE" ]; then
             log_info "Cache HIT (remux): $CACHE_FILE"
-            {
-                echo "=== Cache HIT (remux): File found in cache ==="
-                echo "Copying from cache to: $OUTPUT_FILE"
-            } >> "$SCRIPT_LOG"
+            log_file INFO \
+                "=== Cache HIT (remux): File found in cache ===" \
+                "Cache file: $CACHE_FILE"
+            log_file DEBUG "Copying from cache to: $OUTPUT_FILE"
 
             if cp "$CACHE_FILE" "$OUTPUT_FILE"; then
                 log_info "Successfully restored from cache (remux)"
-                {
-                    echo "=== Successfully restored from cache (remux) ==="
-                    echo "Output file size: $(du -h "$OUTPUT_FILE" | cut -f1)"
-                    echo "=== Exiting with code 0 ==="
-                    echo "=== ============================================================== ==="
-                } >> "$SCRIPT_LOG"
+                log_file INFO "=== Successfully restored from cache (remux) ==="
+                log_file DEBUG \
+                    "Output file size: $(du -h "$OUTPUT_FILE" | cut -f1)" \
+                    "=== Exiting with code 0 ===" \
+                    "=== ============================================================== ==="
                 exit 0
             else
                 rc=$?
                 log_error "Failed to copy from cache (remux, exit code: $rc) — remuxing instead"
-                {
-                    echo "=== ERROR: Failed to copy from cache (remux) ==="
-                    echo "Copy command failed with exit code: $rc"
-                    echo "=== Continuing with remux ==="
-                } >> "$SCRIPT_LOG"
+                log_file INFO \
+                    "=== ERROR: Failed to copy from cache (remux) ===" \
+                    "Copy command failed with exit code: $rc" \
+                    "=== Continuing with remux ==="
             fi
         else
             log_info "Cache MISS (remux) — proceeding with remux"
-            {
-                echo "=== Cache MISS (remux): File not found in cache ==="
-                echo "Proceeding with remux"
-            } >> "$SCRIPT_LOG"
+            log_file INFO \
+                "=== Cache MISS (remux): File not found in cache ===" \
+                "Proceeding with remux"
         fi
     fi
 
-    echo "=== Starting ffmpeg as-is ===" >> "$SCRIPT_LOG"
+    log_file DEBUG "=== Starting ffmpeg as-is ==="
 
     /usr/bin/ffmpeg "$@"
     exit_code=$?
@@ -252,58 +254,47 @@ if [ "$VIDEO_CODEC_IS_COPY" = true ]; then
             compute_cache_file "$INPUT_FILE" "$@"
         fi
 
-        {
-            echo "=== Processing cache copy (remux) ==="
-            echo "Source: $OUTPUT_FILE"
-            echo "Destination: $CACHE_FILE"
-        } >> "$SCRIPT_LOG"
+        log_file DEBUG \
+            "=== Processing cache copy (remux) ===" \
+            "Source: $OUTPUT_FILE" \
+            "Destination: $CACHE_FILE"
 
         if [ -f "$CACHE_FILE" ]; then
             log_warning "Cache file already exists (remux): $CACHE_FILE"
-            {
-                echo "=== WARNING: Cache file already exists (remux) ==="
-                echo "=== Skipping cache copy ==="
-            } >> "$SCRIPT_LOG"
+            log_file INFO "=== WARNING: Cache file already exists (remux) ==="
+            log_file DEBUG "=== Skipping cache copy ==="
         else
             log_info "Copying remuxed file to cache"
-            {
-                echo "=== Copying remuxed file to cache directory ==="
-            } >> "$SCRIPT_LOG"
+            log_file DEBUG "=== Copying remuxed file to cache directory ==="
 
             tmp_cache="${CACHE_FILE}.tmp.$$"
             if cp "$OUTPUT_FILE" "$tmp_cache" && mv "$tmp_cache" "$CACHE_FILE"; then
                 log_info "File successfully copied to cache (remux): $CACHE_FILE"
-                {
-                    echo "=== File successfully copied to cache (remux) ==="
-                    echo "Cache file: $CACHE_FILE"
-                    echo "File size: $(du -h "$CACHE_FILE" | cut -f1)"
-                } >> "$SCRIPT_LOG"
+                log_file INFO \
+                    "=== File successfully copied to cache (remux) ===" \
+                    "Cache file: $CACHE_FILE"
+                log_file DEBUG "File size: $(du -h "$CACHE_FILE" | cut -f1)"
             else
                 rc=$?
                 rm -f "$tmp_cache"
                 log_error "Failed to copy to cache (remux, exit code: $rc)"
-                {
-                    echo "=== ERROR: Failed to copy file to cache (remux) ==="
-                    echo "Copy command failed with exit code: $rc"
-                } >> "$SCRIPT_LOG"
+                log_file INFO \
+                    "=== ERROR: Failed to copy file to cache (remux) ===" \
+                    "Copy command failed with exit code: $rc"
             fi
         fi
     fi
 
-    {
-        echo "=== $(date): Stream copy finished with exit code: $exit_code ==="
-        echo "=== ============================================================== ==="
-    } >> "$SCRIPT_LOG"
+    log_file INFO "=== $(date): Stream copy finished with exit code: $exit_code ==="
+    log_file DEBUG "=== ============================================================== ==="
 
     exit $exit_code
 fi
 
 if [ "$SERVIIO_OUTPUT" = false ]; then
     log_info "Using standard software transcoding (non-Serviio)"
-    {
-        echo "=== Using standard software transcoding ==="
-        echo "=== Starting standard ffmpeg ==="
-    } >> "$SCRIPT_LOG"
+    log_file INFO "=== Using standard software transcoding ==="
+    log_file DEBUG "=== Starting standard ffmpeg ==="
 
     /usr/bin/ffmpeg "$@"
     exit_code=$?
@@ -314,10 +305,8 @@ if [ "$SERVIIO_OUTPUT" = false ]; then
         log_error "Standard ffmpeg failed with exit code: $exit_code"
     fi
 
-    {
-        echo "=== $(date): Standard ffmpeg finished with exit code: $exit_code ==="
-        echo "=== =============================================== ==="
-    } >> "$SCRIPT_LOG"
+    log_file INFO "=== $(date): Standard ffmpeg finished with exit code: $exit_code ==="
+    log_file DEBUG "=== =============================================== ==="
 
     exit $exit_code
 fi
@@ -327,16 +316,15 @@ log_debug "Input: $INPUT_FILE"
 log_debug "Output: $OUTPUT_FILE"
 log_debug "Has filter_complex: $HAS_FILTER_COMPLEX"
 
-{
-    echo "=== Using hardware acceleration for Serviio transcoding ==="
-    echo "Original command: ffmpeg $@"
-    echo "Input file: $INPUT_FILE"
-    echo "Output file: $OUTPUT_FILE"
-    echo "Has filter_complex (subtitles): $HAS_FILTER_COMPLEX"
-    if [ "$HAS_FILTER_COMPLEX" = true ]; then
-        echo "Filter complex value: $FILTER_COMPLEX_VALUE"
-    fi
-} >> "$SCRIPT_LOG"
+log_file INFO \
+    "=== Using hardware acceleration for Serviio transcoding ===" \
+    "Input file: $INPUT_FILE" \
+    "Output file: $OUTPUT_FILE" \
+    "Has filter_complex (subtitles): $HAS_FILTER_COMPLEX"
+log_file DEBUG "Original command: ffmpeg $*"
+if [ "$HAS_FILTER_COMPLEX" = true ]; then
+    log_file DEBUG "Filter complex value: $FILTER_COMPLEX_VALUE"
+fi
 
 # Проверяем наличие файла в кэше перед транскодированием
 # (функция compute_cache_file определена выше — до copy-ветки)
@@ -345,44 +333,41 @@ if [ -n "$INPUT_FILE" ] && [ -n "$OUTPUT_FILE" ]; then
     compute_cache_file "$INPUT_FILE" "$@"
 
     log_debug "Checking cache: $CACHE_FILE"
-    {
-        echo "=== Checking cache ==="
-        echo "Cache file: $CACHE_FILE"
-    } >> "$SCRIPT_LOG"
+    log_file DEBUG \
+        "=== Checking cache ===" \
+        "Cache file: $CACHE_FILE"
 
     if [ -f "$CACHE_FILE" ]; then
         log_info "Cache HIT: $CACHE_FILE"
-        {
-            echo "=== Cache HIT: File found in cache ==="
-            echo "Copying from cache to: $OUTPUT_FILE"
-            echo "Cache file size: $(du -h "$CACHE_FILE" | cut -f1)"
-            echo "Cache file modified: $(stat -c %y "$CACHE_FILE")"
-        } >> "$SCRIPT_LOG"
+        log_file INFO \
+            "=== Cache HIT: File found in cache ===" \
+            "Cache file: $CACHE_FILE"
+        log_file DEBUG \
+            "Copying from cache to: $OUTPUT_FILE" \
+            "Cache file size: $(du -h "$CACHE_FILE" | cut -f1)" \
+            "Cache file modified: $(stat -c %y "$CACHE_FILE")"
 
         if cp "$CACHE_FILE" "$OUTPUT_FILE"; then
             log_info "Successfully restored from cache"
-            {
-                echo "=== Successfully restored from cache ==="
-                echo "Output file size: $(du -h "$OUTPUT_FILE" | cut -f1)"
-                echo "=== Exiting with code 0 ==="
-                echo "=== ============================================================== ==="
-            } >> "$SCRIPT_LOG"
+            log_file INFO "=== Successfully restored from cache ==="
+            log_file DEBUG \
+                "Output file size: $(du -h "$OUTPUT_FILE" | cut -f1)" \
+                "=== Exiting with code 0 ===" \
+                "=== ============================================================== ==="
             exit 0
         else
             rc=$?
             log_error "Failed to copy from cache (exit code: $rc)"
-            {
-                echo "=== ERROR: Failed to copy from cache ==="
-                echo "Copy command failed with exit code: $rc"
-                echo "=== Continuing with transcoding ==="
-            } >> "$SCRIPT_LOG"
+            log_file INFO \
+                "=== ERROR: Failed to copy from cache ===" \
+                "Copy command failed with exit code: $rc" \
+                "=== Continuing with transcoding ==="
         fi
     else
         log_info "Cache MISS — proceeding with transcoding"
-        {
-            echo "=== Cache MISS: File not found in cache ==="
-            echo "Proceeding with transcoding"
-        } >> "$SCRIPT_LOG"
+        log_file INFO \
+            "=== Cache MISS: File not found in cache ===" \
+            "Proceeding with transcoding"
     fi
 fi
 
@@ -515,25 +500,30 @@ run_transcoding() {
     shift 2
 
     log_info "$description (mode: $mode)"
-    {
-        echo "=== $description ==="
-        echo "Mode: $mode"
-    } >> "$SCRIPT_LOG"
+    log_file INFO "=== $description ==="
+    log_file DEBUG "Mode: $mode"
 
     # build_command заполняет глобальный массив BUILT_CMD
     build_command "$mode" "$@"
 
     # Логируем команду (для читаемости — через строку)
     log_debug "Command: ffmpeg ${BUILT_CMD[*]}"
-    {
-        echo "Command: ffmpeg ${BUILT_CMD[*]}"
-        echo "=== Starting transcoding ==="
-    } >> "$SCRIPT_LOG"
+    log_file DEBUG \
+        "Command: ffmpeg ${BUILT_CMD[*]}" \
+        "=== Starting transcoding ==="
 
     # ===== КЛЮЧЕВОЕ ИСПРАВЛЕНИЕ: "${BUILT_CMD[@]}" с кавычками! =====
-    # Это сохраняет пробелы в путях к файлам
-    /usr/bin/ffmpeg "${BUILT_CMD[@]}" 2>> "$SCRIPT_LOG"
+    # Это сохраняет пробелы в путях к файлам.
+    # stderr ffmpeg: при DEBUG — всегда в лог; при INFO — только если уровень
+    # упал (прогресс "frame= ..." при успехе в лог не попадает).
+    STDERR_TMP="${SCRIPT_LOG}.stderr.$$"
+    /usr/bin/ffmpeg "${BUILT_CMD[@]}" 2>"$STDERR_TMP"
     local result=$?
+
+    if [ "$LOG_LEVEL" = "DEBUG" ] || [ $result -ne 0 ]; then
+        cat "$STDERR_TMP" >> "$SCRIPT_LOG"
+    fi
+    rm -f "$STDERR_TMP"
 
     if [ $result -eq 0 ]; then
         log_info "$description completed successfully"
@@ -541,9 +531,7 @@ run_transcoding() {
         log_warning "$description failed with exit code: $result"
     fi
 
-    {
-        echo "=== Finished with exit code: $result ==="
-    } >> "$SCRIPT_LOG"
+    log_file INFO "=== Finished with exit code: $result ==="
 
     return $result
 }
@@ -553,9 +541,7 @@ exit_code=1
 # Уровень 1: Аппаратное с субтитрами (если есть субтитры)
 if [ "$HAS_FILTER_COMPLEX" = true ]; then
     log_info "LEVEL 1: Trying hardware acceleration WITH subtitles"
-    {
-        echo "=== LEVEL 1: Trying hardware acceleration WITH subtitles ==="
-    } >> "$SCRIPT_LOG"
+    log_file INFO "=== LEVEL 1: Trying hardware acceleration WITH subtitles ==="
 
     run_transcoding "hardware_with_subs" "Hardware with subtitles" "$@"
     exit_code=$?
@@ -564,9 +550,7 @@ fi
 # Уровень 2: Аппаратное без субтитров
 if [ $exit_code -ne 0 ]; then
     log_info "LEVEL 2: Trying hardware acceleration WITHOUT subtitles"
-    {
-        echo "=== LEVEL 2: Trying hardware acceleration WITHOUT subtitles ==="
-    } >> "$SCRIPT_LOG"
+    log_file INFO "=== LEVEL 2: Trying hardware acceleration WITHOUT subtitles ==="
 
     run_transcoding "hardware_no_subs" "Hardware without subtitles" "$@"
     exit_code=$?
@@ -575,9 +559,7 @@ fi
 # Уровень 3: Софтовое с субтитрами (если были субтитры)
 if [ $exit_code -ne 0 ] && [ "$HAS_FILTER_COMPLEX" = true ]; then
     log_info "LEVEL 3: Trying software encoding WITH subtitles"
-    {
-        echo "=== LEVEL 3: Trying software encoding WITH subtitles ==="
-    } >> "$SCRIPT_LOG"
+    log_file INFO "=== LEVEL 3: Trying software encoding WITH subtitles ==="
 
     run_transcoding "software_with_subs" "Software with subtitles" "$@"
     exit_code=$?
@@ -586,9 +568,7 @@ fi
 # Уровень 4: Софтовое без субтитров
 if [ $exit_code -ne 0 ]; then
     log_info "LEVEL 4: Trying software encoding WITHOUT subtitles"
-    {
-        echo "=== LEVEL 4: Trying software encoding WITHOUT subtitles ==="
-    } >> "$SCRIPT_LOG"
+    log_file INFO "=== LEVEL 4: Trying software encoding WITHOUT subtitles ==="
 
     run_transcoding "software_no_subs" "Software without subtitles" "$@"
     exit_code=$?
@@ -608,45 +588,39 @@ if [ $exit_code -eq 0 ] && [ -n "$OUTPUT_FILE" ] && [ -f "$OUTPUT_FILE" ]; then
     fi
 
     log_debug "Processing cache copy: $OUTPUT_FILE -> $CACHE_FILE"
-    {
-        echo "=== Processing cache copy ==="
-        echo "Source: $OUTPUT_FILE"
-        echo "Destination: $CACHE_FILE"
-    } >> "$SCRIPT_LOG"
+    log_file DEBUG \
+        "=== Processing cache copy ===" \
+        "Source: $OUTPUT_FILE" \
+        "Destination: $CACHE_FILE"
 
     if [ -f "$CACHE_FILE" ]; then
         log_warning "Cache file already exists: $CACHE_FILE"
-        {
-            echo "=== WARNING: Cache file already exists ==="
-            echo "Existing file: $CACHE_FILE"
-            echo "Size: $(du -h "$CACHE_FILE" | cut -f1)"
-            echo "Modified: $(stat -c %y "$CACHE_FILE")"
-            echo "=== Skipping cache copy ==="
-        } >> "$SCRIPT_LOG"
+        log_file INFO "=== WARNING: Cache file already exists ==="
+        log_file DEBUG \
+            "Existing file: $CACHE_FILE" \
+            "Size: $(du -h "$CACHE_FILE" | cut -f1)" \
+            "Modified: $(stat -c %y "$CACHE_FILE")" \
+            "=== Skipping cache copy ==="
     else
         log_info "Copying transcoded file to cache"
-        {
-            echo "=== Copying transcoded file to cache directory ==="
-        } >> "$SCRIPT_LOG"
+        log_file DEBUG "=== Copying transcoded file to cache directory ==="
 
         # Атомарная запись: сперва во временный файл, затем mv внутри той же ФС.
         # Убитый посреди копирования процесс не оставит битый файл в кэше.
         tmp_cache="${CACHE_FILE}.tmp.$$"
         if cp "$OUTPUT_FILE" "$tmp_cache" && mv "$tmp_cache" "$CACHE_FILE"; then
             log_info "File successfully copied to cache: $CACHE_FILE"
-            {
-                echo "=== File successfully copied to cache ==="
-                echo "Cache file: $CACHE_FILE"
-                echo "File size: $(du -h "$CACHE_FILE" | cut -f1)"
-            } >> "$SCRIPT_LOG"
+            log_file INFO \
+                "=== File successfully copied to cache ===" \
+                "Cache file: $CACHE_FILE"
+            log_file DEBUG "File size: $(du -h "$CACHE_FILE" | cut -f1)"
         else
             rc=$?
             rm -f "$tmp_cache"
             log_error "Failed to copy to cache (exit code: $rc)"
-            {
-                echo "=== ERROR: Failed to copy file to cache ==="
-                echo "Copy command failed with exit code: $rc"
-            } >> "$SCRIPT_LOG"
+            log_file INFO \
+                "=== ERROR: Failed to copy file to cache ===" \
+                "Copy command failed with exit code: $rc"
         fi
     fi
 else
@@ -658,16 +632,14 @@ else
         log_debug "Skipping cache copy — output file path not detected"
     fi
 
-    {
-        echo "=== Skipping cache copy ==="
-        if [ $exit_code -ne 0 ]; then
-            echo "Reason: Transcoding failed (exit code: $exit_code)"
-        elif [ ! -f "$OUTPUT_FILE" ]; then
-            echo "Reason: Output file not found: $OUTPUT_FILE"
-        else
-            echo "Reason: Output file path not detected"
-        fi
-    } >> "$SCRIPT_LOG"
+    log_file INFO "=== Skipping cache copy ==="
+    if [ $exit_code -ne 0 ]; then
+        log_file INFO "Reason: Transcoding failed (exit code: $exit_code)"
+    elif [ ! -f "$OUTPUT_FILE" ]; then
+        log_file INFO "Reason: Output file not found: $OUTPUT_FILE"
+    else
+        log_file INFO "Reason: Output file path not detected"
+    fi
 fi
 
 if [ $exit_code -eq 0 ]; then
@@ -676,8 +648,7 @@ else
     log_error "=== ffmpeg_serviio failed with exit code: $exit_code ==="
 fi
 
-{
-    echo "=== ============================================================== ==="
-} >> "$SCRIPT_LOG"
+log_file INFO "=== $(date): ffmpeg_serviio finished with exit code: $exit_code ==="
+log_file DEBUG "=== ============================================================== ==="
 
 exit $exit_code
